@@ -1,113 +1,57 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import (
-    StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, ReduceLROnPlateau
-)
+# ========================
+# Utilities: domain losses
+# ========================
 
-# ============================================================
-#  ACCURACY
-# ============================================================
-def accuracy(outputs, labels):
+DOMAIN_LOSS = "mmd"  # "coral" hoặc "mmd"
+
+def _covariance_matrix(x: torch.Tensor) -> torch.Tensor:
+    n, d = x.shape
+    if n <= 1:
+        return torch.zeros((d, d), device=x.device, dtype=x.dtype)
+    xc = x - x.mean(dim=0, keepdim=True)
+    return xc.t().matmul(xc) / (n - 1)
+
+def coral_loss(src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    """CORAL loss between src (n x d) and tgt (m x d)."""
+    if src.numel() == 0 or tgt.numel() == 0:
+        return torch.tensor(0.0, device=src.device)
+    Cs = _covariance_matrix(src)
+    Ct = _covariance_matrix(tgt)
+    diff = Cs - Ct
+    d = src.size(1)
+    loss = torch.norm(diff, p="fro") ** 2
+    return loss / (4.0 * (d ** 2))
+
+def _rbf_kernel_matrix(x: torch.Tensor, y: torch.Tensor, kernel_mul: float = 2.0, kernel_num: int = 5) -> torch.Tensor:
+    total = torch.cat([x, y], dim=0)
+    L2 = ((total.unsqueeze(0) - total.unsqueeze(1)) ** 2).sum(dim=2)
+    sigma = L2.mean().detach() + 1e-8
+    sigmas = [sigma * (kernel_mul ** i) for i in range(kernel_num)]
+    kernels = [torch.exp(-L2 / s) for s in sigmas]
+    return sum(kernels)
+
+def mmd_rbf_loss(src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    """RBF-MMD loss between src and tgt."""
+    if src.size(0) < 1 or tgt.size(0) < 1:
+        return torch.tensor(0.0, device=src.device)
+    K = _rbf_kernel_matrix(src, tgt)
+    m = src.size(0)
+    n = tgt.size(0)
+    K_ss = K[:m, :m]
+    K_tt = K[m:, m:]
+    K_st = K[:m, m:]
+    loss = K_ss.mean() + K_tt.mean() - 2.0 * K_st.mean()
+    return loss
+
+def domain_loss_from_batch(features: torch.Tensor, domain_ids: torch.Tensor) -> torch.Tensor:
     """
-    outputs: logits (B, num_classes)
-    labels: ground truth (B)
+    Convenience wrapper: split features by domain_id (0=source,1=target)
+    and compute chosen domain loss.
     """
-    preds = outputs.argmax(dim=1)
-    correct = (preds == labels).sum().item()
-    return correct / len(labels)
-
-
-# ============================================================
-#  LOSS FUNCTION SELECTOR
-# ============================================================
-def get_loss(loss_name):
-    loss_name = loss_name.lower()
-
-    if loss_name == "crossentropy":
-        return nn.CrossEntropyLoss()
-    elif loss_name == "mse":
-        return nn.MSELoss()
-    elif loss_name == "smoothl1":
-        return nn.SmoothL1Loss()
+    src = features[domain_ids == 0]
+    tgt = features[domain_ids == 1]
+    if DOMAIN_LOSS == "coral":
+        return coral_loss(src, tgt)
     else:
-        raise ValueError(f"Loss '{loss_name}' is not supported!")
-
-
-# ============================================================
-#  OPTIMIZER SELECTOR
-# ============================================================
-def get_optimizer(opt_name, parameters, lr, weight_decay=0):
-    opt_name = opt_name.lower()
-
-    if opt_name == "sgd":
-        return optim.SGD(parameters, lr=lr, momentum=0.9, weight_decay=weight_decay)
-    elif opt_name == "adam":
-        return optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
-    elif opt_name == "adamw":
-        return optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
-    elif opt_name == "rmsprop":
-        return optim.RMSprop(parameters, lr=lr, weight_decay=weight_decay)
-    else:
-        raise ValueError(f"Optimizer '{opt_name}' is not supported!")
-
-
-# ============================================================
-#  LR SCHEDULER SELECTOR
-# ============================================================
-def get_scheduler(scheduler_name, optimizer, **kwargs):
-    if scheduler_name is None or scheduler_name.lower() == "none":
-        return None
-
-    scheduler_name = scheduler_name.lower()
-
-    if scheduler_name == "step":
-        return StepLR(optimizer, step_size=kwargs.get("step_size", 10),
-                      gamma=kwargs.get("gamma", 0.1))
-
-    elif scheduler_name == "multistep":
-        return MultiStepLR(optimizer, milestones=kwargs.get("milestones", [30, 60]),
-                           gamma=kwargs.get("gamma", 0.1))
-
-    elif scheduler_name == "exp":
-        return ExponentialLR(optimizer, gamma=kwargs.get("gamma", 0.95))
-
-    elif scheduler_name == "cosine":
-        return CosineAnnealingLR(optimizer, T_max=kwargs.get("t_max", 20))
-
-    elif scheduler_name == "plateau":
-        return ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
-
-    else:
-        raise ValueError(f"Scheduler '{scheduler_name}' is not supported!")
-
-
-# ============================================================
-#  EPOCH METRICS (train_loss, val_loss, train_acc, val_acc)
-# ============================================================
-def evaluate_model(model, dataloader, device, criterion):
-    model.eval()
-    total_loss, total_acc, total_samples = 0, 0, 0
-
-    with torch.no_grad():
-        for x, y in dataloader:
-            x, y = x.to(device), y.to(device)
-            out = model(x)
-            loss = criterion(out, y)
-
-            batch_size = y.size(0)
-            total_loss += loss.item() * batch_size
-            total_acc  += accuracy(out, y) * batch_size
-            total_samples += batch_size
-
-    avg_loss = total_loss / total_samples
-    avg_acc  = total_acc  / total_samples
-    return avg_loss, avg_acc
-
-
-# ============================================================
-#  SAVE MODEL
-# ============================================================
-# def save_model(model, path="checkpoint.pth"):
-#     torch.save(model.state_dict(), path)
-#     print(f"Model saved at {path}")
+        return mmd_rbf_loss(src, tgt)

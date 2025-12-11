@@ -1,77 +1,72 @@
-import torch
-import numpy as np
 import os
+import torch
 from torch.utils.data import Dataset, DataLoader
-
 from PrepareData.Transform import transformation
 from PrepareData.SignalSegments import (
     src_train, src_val, src_test,
-    tgt_train, tgt_val, tgt_test
+    tgt_train, tgt_val, tgt_test,
+    LABEL_TO_IDX
 )
 
-# ---------------- CONFIG ----------------
+# ========================
+# CONFIG
+# ========================
 BATCH = 32
 Fourier_transform = "STFT"   # hoặc "FFT"
 
-# =====================================================
-# 1) Lấy domain từ đường dẫn
-# =====================================================
-def get_domain_id(file_path):
-    folder = os.path.basename(os.path.dirname(file_path)).lower()
-
-    if folder == "0nm": return 0
-    elif folder == "2nm": return 1
-    elif folder == "4nm": return 2
-    else:
-        raise ValueError(f"Không nhận diện domain từ folder: {folder}")
+DOMAIN_TO_ID = {"0nm": 0, "2nm": 1, "4nm": 2}
 
 
-# =====================================================
-# 2) Dataset
-# =====================================================
+def get_domain_id(path):
+    """Trích domain ID từ folder chứa tệp."""
+    folder = os.path.basename(os.path.dirname(path)).lower()
+    return DOMAIN_TO_ID.get(folder, -1)
+
+
+# ========================
+# Dataset class
+# ========================
 class VibDataset(Dataset):
 
-    def __init__(self, dataframe):
-        self.df = dataframe
-        self.labels = sorted(self.df["label"].unique())
-        self.label_to_idx = {lb: i for i, lb in enumerate(self.labels)}
+    def __init__(self, df):
+        self.df = df.reset_index(drop=True)
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
+
         row = self.df.iloc[idx]
+        seg = transformation(row["segment"].astype(float), Fourier_transform)
 
-        # ---- segment ----
-        seg = row["segment"].astype(float)
+        # ----- Convert to tensor -----
+        if isinstance(seg, torch.Tensor):
+            seg = seg.clone().detach().float()
+        else:
+            seg = torch.from_numpy(seg).float()
+        if Fourier_transform == "STFT":
+            seg = torch.abs(seg)
+            if seg.dim() == 2 and seg.size(1) < 8:   # soft padding
+                seg = torch.nn.functional.pad(seg, (0, 8 - seg.size(1)))
+        seg = seg.unsqueeze(0)   # (1, F, T) hoặc (1, L)
 
-        # ---- Fourier transform ----
-        seg = transformation(seg, Fourier_transform)
+        # ----- Label & Domain -----
+        label  = torch.tensor(LABEL_TO_IDX[row["label"]], dtype=torch.long)
+        domain = torch.tensor(get_domain_id(row["path"]), dtype=torch.long)
 
-        # ---- reshape ----
-        if Fourier_transform == "FFT":
-            seg = torch.tensor(seg, dtype=torch.float32).unsqueeze(0)  # (1,512)
-
-        else:   # STFT
-            seg = torch.abs(seg) if isinstance(seg, torch.Tensor) else torch.tensor(seg, dtype=torch.float32)
-            seg = seg.unsqueeze(0)  # (1,F,T)
-
-        # ---- label ----
-        label = torch.tensor(self.label_to_idx[row["label"]], dtype=torch.long)
-
-        # ---- domain ----
-        domain_id = torch.tensor(get_domain_id(row["path"]), dtype=torch.long)
-
-        return seg, label, domain_id
+        return seg, label, domain
 
 
-# =====================================================
-# 3) Build DataLoaders
-# =====================================================
-source_train_loader = DataLoader(VibDataset(src_train), batch_size=BATCH, shuffle=True)
-source_val_loader   = DataLoader(VibDataset(src_val),   batch_size=BATCH, shuffle=False)
-source_test_loader  = DataLoader(VibDataset(src_test),  batch_size=BATCH, shuffle=False)
+# ========================
+# Build DataLoaders
+# ========================
+def build_loader(df, shuffle=False):
+    return DataLoader(VibDataset(df), batch_size=BATCH, shuffle=shuffle)
 
-target_train_loader = DataLoader(VibDataset(tgt_train), batch_size=BATCH, shuffle=True)
-target_val_loader   = DataLoader(VibDataset(tgt_val),   batch_size=BATCH, shuffle=False)
-target_test_loader  = DataLoader(VibDataset(tgt_test),  batch_size=BATCH, shuffle=False)
+source_train_loader = build_loader(src_train, shuffle=True)
+source_val_loader   = build_loader(src_val)
+source_test_loader  = build_loader(src_test)
+
+target_train_loader = build_loader(tgt_train, shuffle=True)
+target_val_loader   = build_loader(tgt_val)
+target_test_loader  = build_loader(tgt_test)
